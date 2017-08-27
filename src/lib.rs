@@ -3,7 +3,6 @@ extern crate seahash;
 extern crate stable_heap;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::ops::Deref;
 use std::time::Instant;
 use std::marker::PhantomData;
@@ -13,7 +12,6 @@ use std::{fmt, mem, ptr};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use seahash::SeaHasher;
 
-const PAGE_SIZE: usize = 4096;
 const WORDSIZE: usize = 8;
 const TRIES: usize = 8;
 
@@ -57,7 +55,7 @@ impl<K, V> Entry<K, V> {
     }
 }
 
-struct Cache<K> {
+pub struct Cache<K> {
     allocations: RwLock<BTreeMap<usize, usize>>,
     size: usize,
     slab: *mut u8,
@@ -97,7 +95,7 @@ impl<'a, V: fmt::Debug> Deref for Reference<'a, V> {
 }
 
 impl<K: Hash + Eq + fmt::Debug> Cache<K> {
-    fn new(size: usize) -> Self {
+    pub fn new(size: usize) -> Self {
         Cache {
             allocations: RwLock::new(BTreeMap::new()),
             slab: unsafe {
@@ -123,13 +121,23 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
         }
     }
 
-    fn insert<V: Sized + fmt::Debug>(&self, key: K, val: V) -> Reference<V> {
+    pub fn insert<V: Sized + fmt::Debug>(
+        &self,
+        key: K,
+        val: V,
+    ) -> Reference<V> {
         let size = Entry::<K, V>::size();
         let orig_offset = self.offset::<V>(&key);
         let mut offset = orig_offset;
         let mut allocations = self.allocations.write();
         let mut found = None;
-        println!("inserting {:?} size {} @ {}", &key, size, offset);
+        println!(
+            "inserting {:?}: {:?} size {} @ {}",
+            &key,
+            &val,
+            size,
+            offset
+        );
 
         {
             let mut tries = TRIES + 1;
@@ -250,7 +258,6 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
         for range in ranges {
             for i in 0..range.len() {
                 let (offset, entry_size, _) = range[i];
-                println!("candidate: {}", offset);
                 if entry_size >= &size {
                     // we could fit the value in this one entry
                     let atime = unsafe {
@@ -261,6 +268,8 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
                     };
                     candidates.insert(atime, offset);
                 } else {
+                    // we need to group up multiple entries to see
+                    // what can be thrown out.
                     panic!();
                 }
             }
@@ -269,13 +278,13 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
         candidates.iter().next().map(|(_score, offset)| **offset)
     }
 
-    fn get<'a, V: 'a + fmt::Debug>(
-        &self,
-        key: &'a K,
+    pub fn get<'a, V: 'a + fmt::Debug>(
+        &'a self,
+        key: &K,
     ) -> Option<Reference<'a, V>> {
         println!("getting {:?}", &key);
-        let mut offset = self.offset::<V>(&key);
-        let mut allocations = self.allocations.read();
+        let offset = self.offset::<V>(&key);
+        let allocations = self.allocations.read();
 
         let check = allocations.range(offset..).chain(allocations.iter());
 
@@ -312,8 +321,39 @@ mod tests {
         for i in 0..n {
             assert_eq!(*cache.insert(i, i), i);
             let gotten = cache.get::<usize>(&i);
-            println!("{} gotten: {:?}", i, gotten);
             assert_eq!(*gotten.unwrap(), i);
+        }
+        // 0 should have fallen out by now!
+        assert!(cache.get::<usize>(&0).is_none());
+    }
+
+    #[test]
+    fn keepalive() {
+        let cache = Cache::new(4096);
+
+        let n: usize = 10_000;
+
+        for i in 0..n {
+            assert_eq!(*cache.insert(i, i), i);
+            let gotten = cache.get::<usize>(&i);
+            assert_eq!(*gotten.unwrap(), i);
+            let _keepalive = cache.get::<usize>(&0);
+        }
+        // 0 should have been kept alive!
+        assert_eq!(*cache.get::<usize>(&0).unwrap(), 0);
+    }
+
+    #[test]
+    fn larger() {
+        let cache = Cache::new(4096);
+
+        let n: usize = 1_000;
+
+        for i in 0..n {
+            let block = [i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i];
+            assert_eq!(*cache.insert(i, block.clone()), block.clone());
+            let gotten = cache.get::<[usize; 16]>(&i);
+            assert_eq!(*gotten.unwrap(), block);
         }
     }
 }

@@ -27,12 +27,6 @@ struct Entry<K, V> {
     val: V,
 }
 
-impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Entry<K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Entry ( key: {:?}, val: {:?} )", self.key, self.val)
-    }
-}
-
 impl<K, V> Entry<K, V> {
     fn new(key: K, val: V) -> Self {
         Entry {
@@ -55,11 +49,45 @@ impl<K, V> Entry<K, V> {
     }
 }
 
-pub struct Cache<K> {
+pub struct Page<K> {
     allocations: RwLock<BTreeMap<usize, usize>>,
     size: usize,
     slab: *mut u8,
     _marker: PhantomData<K>,
+}
+
+unsafe impl<K> Send for Page<K> {}
+unsafe impl<K> Sync for Page<K> {}
+
+pub struct Cache<K>(Vec<Page<K>>);
+
+impl<K: Hash + Eq> Cache<K> {
+    pub fn new(num_pages: usize, page_size: usize) -> Self {
+        assert!(num_pages > 0, "Must have at least one page");
+        let mut pages = Vec::with_capacity(num_pages);
+        for _ in 0..num_pages {
+            pages.push(Page::new(page_size))
+        }
+        Cache(pages)
+    }
+
+    fn hash(key: &K) -> u64 {
+        let mut hasher = SeaHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    pub fn insert<V: Sized>(&self, key: K, val: V) -> Reference<V> {
+        let hash = Self::hash(&key);
+        let page = hash as usize % self.0.len();
+        self.0[page].insert(hash, key, val)
+    }
+
+    pub fn get<'a, V: 'a>(&'a self, key: &K) -> Option<Reference<'a, V>> {
+        let hash = Self::hash(&key);
+        let page = hash as usize % self.0.len();
+        self.0[page].get(hash, key)
+    }
 }
 
 pub enum Reference<'a, V> {
@@ -84,7 +112,7 @@ where
     }
 }
 
-impl<'a, V: fmt::Debug> Deref for Reference<'a, V> {
+impl<'a, V> Deref for Reference<'a, V> {
     type Target = V;
     fn deref(&self) -> &V {
         match *self {
@@ -94,9 +122,9 @@ impl<'a, V: fmt::Debug> Deref for Reference<'a, V> {
     }
 }
 
-impl<K: Hash + Eq + fmt::Debug> Cache<K> {
+impl<K: Hash + Eq> Page<K> {
     pub fn new(size: usize) -> Self {
-        Cache {
+        Page {
             allocations: RwLock::new(BTreeMap::new()),
             slab: unsafe {
                 stable_heap::allocate(size, mem::align_of::<usize>())
@@ -106,13 +134,10 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
         }
     }
 
-    fn offset<V: Sized>(&self, key: &K) -> usize {
+    fn offset<V: Sized>(&self, hash: u64) -> usize {
         let size = Entry::<K, V>::size();
-        let mut hasher = SeaHasher::new();
-        key.hash(&mut hasher);
-        let hash = hasher.finish() as usize;
         // TODO check if wraparound / page alignment is neccesary...
-        let offset = (hash % (self.size / WORDSIZE)) * WORDSIZE;
+        let offset = (hash as usize % (self.size / WORDSIZE)) * WORDSIZE;
         if offset + size > self.size {
             // wraparound
             0
@@ -121,24 +146,12 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
         }
     }
 
-    pub fn insert<V: Sized + fmt::Debug>(
-        &self,
-        key: K,
-        val: V,
-    ) -> Reference<V> {
+    pub fn insert<V: Sized>(&self, hash: u64, key: K, val: V) -> Reference<V> {
         let size = Entry::<K, V>::size();
-        let orig_offset = self.offset::<V>(&key);
+        let orig_offset = self.offset::<V>(hash);
         let mut offset = orig_offset;
         let mut allocations = self.allocations.write();
         let mut found = None;
-        println!(
-            "inserting {:?}: {:?} size {} @ {}",
-            &key,
-            &val,
-            size,
-            offset
-        );
-
         {
             let mut tries = TRIES + 1;
             loop {
@@ -155,12 +168,11 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
 
                 // check the area before this offset
                 match allocations.range(..offset).next_back() {
-                    None => () // println!("none before")
-                        ,
+                    None => (),
                     Some(before) => if offset >= before.0 + before.1 {
-                        // println!("before with enough room");
+                        // before with enough room
                     } else {
-                        // println!("before with not enough room");
+                        // before with not enough room;
                         offset = before.0 + before.1;
                         continue;
                     },
@@ -169,16 +181,15 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
                 // check the area after this offset
                 match allocations.range(offset..).next() {
                     None => {
-                        // println!("none after");
                         found = Some(offset);
                         break;
                     }
                     Some(after) => if offset + size < *after.0 {
-                        // println!("afte after with enough room");
+                        // after with enough room"
                         found = Some(offset);
                         break;
                     } else {
-                        // println!("after after with not enough room");
+                        // after with not enough room
                         offset = after.0 + after.1;
                         continue;
                     },
@@ -187,7 +198,6 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
         }
         loop {
             if let Some(found) = found {
-                println!("writing {:?} to {} size {}", &key, found, size);
                 let entry = Entry::new(key, val);
                 debug_assert!(found + size <= self.size);
                 allocations.insert(found, size);
@@ -198,8 +208,6 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
                     let vptr = &(*ptr).val;
                     let guard = (*ptr).lock.read();
 
-                    println!("entry written @ {}: {:?}", offset, &(*ptr));
-
                     return Reference::Cached { ptr: vptr, guard };
                 }
             } else {
@@ -209,10 +217,8 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
                             allocations.remove(&offset);
                         }
                         found = Some(*offsets.first().expect("len > 1"));
-                        println!("evicted {:?}", offset);
                     }
                     None => {
-                        println!("spilled value");
                         return Reference::Spilled(val);
                     }
                 }
@@ -226,7 +232,6 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
         size: usize,
         allocations: &mut RwLockWriteGuard<BTreeMap<usize, usize>>,
     ) -> Option<Vec<usize>> {
-        println!("evict from {}", from);
         let mut ranges = vec![];
         let mut adjacent = vec![];
         {
@@ -240,7 +245,6 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
 
                     match entry.lock.try_write() {
                         Some(writeguard) => {
-                            // println!("got write");
                             if last_offset > *offset {
                                 // we wrapped
                                 if adjacent.len() > 0 {
@@ -251,12 +255,9 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
                             }
                             adjacent.push((offset, size, writeguard));
                         }
-                        None => {
-                            // println!("why u no write");
-                            if adjacent.len() > 0 {
-                                ranges.push(mem::replace(&mut adjacent, vec![]))
-                            }
-                        }
+                        None => if adjacent.len() > 0 {
+                            ranges.push(mem::replace(&mut adjacent, vec![]))
+                        },
                     }
                 }
                 last_offset = *offset;
@@ -328,12 +329,12 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
             .map(|(_, val)| mem::replace(val, vec![]))
     }
 
-    pub fn get<'a, V: 'a + fmt::Debug>(
+    pub fn get<'a, V: 'a>(
         &'a self,
+        hash: u64,
         key: &K,
     ) -> Option<Reference<'a, V>> {
-        println!("getting {:?}", &key);
-        let offset = self.offset::<V>(&key);
+        let offset = self.offset::<V>(hash);
         let allocations = self.allocations.read();
 
         let check = allocations.range(offset..).chain(allocations.iter());
@@ -342,8 +343,6 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
             unsafe {
                 let ptr = self.slab.offset(*offset as isize);
                 let entry: &Entry<K, V> = mem::transmute(ptr);
-
-                println!("entry at {}\n{:?}", offset, entry);
 
                 if &entry.key == key {
                     *entry.atime.write() = Instant::now();
@@ -362,9 +361,12 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+    use std::thread;
+
     #[test]
     fn usizes() {
-        let cache = Cache::new(4096);
+        let cache = Cache::new(1, 4096);
 
         let n: usize = 10_000;
 
@@ -379,7 +381,7 @@ mod tests {
 
     #[test]
     fn keepalive() {
-        let cache = Cache::new(4096);
+        let cache = Cache::new(1, 4096);
 
         let n: usize = 10_000;
 
@@ -395,7 +397,7 @@ mod tests {
 
     #[test]
     fn larger() {
-        let cache = Cache::new(4096);
+        let cache = Cache::new(1, 4096);
 
         let n: usize = 1_000;
 
@@ -408,8 +410,43 @@ mod tests {
     }
 
     #[test]
+    fn multithreading() {
+        let cache = Arc::new(Cache::new(32, 4096));
+
+        let n: usize = 1000;
+
+        let mut handles = vec![];
+
+        for i in 0..n {
+            let cache = cache.clone();
+            handles.push(thread::spawn(move || {
+                let block = [i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i];
+                assert_eq!(*cache.insert(i, block.clone()), block.clone());
+            }))
+        }
+
+        for handle in handles {
+            handle.join().unwrap()
+        }
+    }
+
+    #[test]
+    fn lots() {
+        let cache = Cache::new(32, 4096);
+
+        let n: usize = 100_000;
+
+        for i in 0..n {
+            let block = [i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i];
+            assert_eq!(*cache.insert(i, block.clone()), block.clone());
+            let gotten = cache.get::<[usize; 16]>(&i);
+            assert_eq!(*gotten.unwrap(), block);
+        }
+    }
+
+    #[test]
     fn evict_multiple() {
-        let cache = Cache::new(4096);
+        let cache = Cache::new(1, 4096);
 
         // first fill cache with small values
         let n: usize = 1000;
@@ -433,7 +470,7 @@ mod tests {
 
     #[test]
     fn evict_multiple_keepalive() {
-        let cache = Cache::new(4096);
+        let cache = Cache::new(1, 4096);
 
         cache.insert(0usize, 0usize);
 
@@ -452,7 +489,7 @@ mod tests {
 
     #[test]
     fn big_then_small() {
-        let cache = Cache::new(4096);
+        let cache = Cache::new(1, 4096);
 
         // first fill cache with large values
         let n: usize = 1_000;

@@ -1,0 +1,9 @@
+[package]
+authors = ["Kristoffer Ström <kristoffer@rymdkoloni.se>"]
+name = "testz"
+version = "0.1.0"
+
+[dependencies]
+parking_lot = "0.4.5"
+seahash = "3.0.5"
+stable-heap = "0.1.0"

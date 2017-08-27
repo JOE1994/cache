@@ -204,10 +204,12 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
                 }
             } else {
                 match self.evict(orig_offset, size, &mut allocations) {
-                    Some(offset) => {
-                        allocations.remove(&offset);
-                        found = Some(offset);
-                        println!("evicted {}", offset);
+                    Some(offsets) => {
+                        for offset in &offsets {
+                            allocations.remove(&offset);
+                        }
+                        found = Some(*offsets.first().expect("len > 1"));
+                        println!("evicted {:?}", offset);
                     }
                     None => {
                         println!("spilled value");
@@ -223,7 +225,7 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
         from: usize,
         size: usize,
         allocations: &mut RwLockWriteGuard<BTreeMap<usize, usize>>,
-    ) -> Option<usize> {
+    ) -> Option<Vec<usize>> {
         println!("evict from {}", from);
         let mut ranges = vec![];
         let mut adjacent = vec![];
@@ -266,7 +268,7 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
                         // we clone since `Instance` is two words
                         entry.atime.lock().clone()
                     };
-                    candidates.insert(atime, offset);
+                    candidates.insert(atime, vec![*offset]);
                 } else {
                     // we need to group up multiple entries to see
                     // what can be thrown out.
@@ -275,7 +277,10 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
             }
         }
 
-        candidates.iter().next().map(|(_score, offset)| **offset)
+        candidates
+            .iter_mut()
+            .next()
+            .map(|(_, val)| mem::replace(val, vec![]))
     }
 
     pub fn get<'a, V: 'a + fmt::Debug>(
@@ -356,4 +361,26 @@ mod tests {
             assert_eq!(*gotten.unwrap(), block);
         }
     }
+
+    // #[test]
+    // fn evict_multiple() {
+    //     let cache = Cache::new(4096);
+
+    //     // first fill cache with small values
+    //     let n: usize = 1000;
+    //     for i in 0..n {
+    //         assert_eq!(*cache.insert(i, i), i);
+    //         let gotten = cache.get::<usize>(&i);
+    //         assert_eq!(*gotten.unwrap(), i);
+    //     }
+
+    //     // then evict them with larger
+    //     let n: usize = 1_000;
+    //     for i in 0..n {
+    //         let block = [i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i];
+    //         assert_eq!(*cache.insert(i, block.clone()), block.clone());
+    //         let gotten = cache.get::<[usize; 16]>(&i);
+    //         assert_eq!(*gotten.unwrap(), block);
+    //     }
+    // }
 }

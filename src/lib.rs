@@ -4,12 +4,12 @@ extern crate stable_heap;
 
 use std::collections::BTreeMap;
 use std::ops::Deref;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::marker::PhantomData;
 use std::hash::{Hash, Hasher};
 use std::{fmt, mem, ptr};
 
-use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use seahash::SeaHasher;
 
 const WORDSIZE: usize = 8;
@@ -21,7 +21,7 @@ const TRIES: usize = 8;
 struct Entry<K, V> {
     key: K,
     lock: RwLock<()>,
-    atime: Mutex<Instant>,
+    atime: RwLock<Instant>,
     // val is of arbitrary size, and has to be on the end
     // to access the other fields with V erased
     val: V,
@@ -38,7 +38,7 @@ impl<K, V> Entry<K, V> {
         Entry {
             key,
             val,
-            atime: Mutex::new(Instant::now()),
+            atime: RwLock::new(Instant::now()),
             lock: RwLock::new(()),
         }
     }
@@ -232,7 +232,7 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
         {
             // wraparound
             let check = allocations.range(from..).chain(allocations.iter());
-
+            let mut last_offset = 0;
             for (offset, size) in check.take(TRIES) {
                 unsafe {
                     let ptr = self.slab.offset(*offset as isize);
@@ -241,14 +241,25 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
                     match entry.lock.try_write() {
                         Some(writeguard) => {
                             // println!("got write");
+                            if last_offset > *offset {
+                                // we wrapped
+                                if adjacent.len() > 0 {
+                                    ranges.push(
+                                        mem::replace(&mut adjacent, vec![]),
+                                    )
+                                }
+                            }
                             adjacent.push((offset, size, writeguard));
                         }
                         None => {
                             // println!("why u no write");
-                            ranges.push(mem::replace(&mut adjacent, vec![]))
+                            if adjacent.len() > 0 {
+                                ranges.push(mem::replace(&mut adjacent, vec![]))
+                            }
                         }
                     }
                 }
+                last_offset = *offset;
             }
         }
         if adjacent.len() > 0 {
@@ -258,28 +269,62 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
         let mut candidates = BTreeMap::new();
 
         for range in ranges {
-            for i in 0..range.len() {
-                let (offset, entry_size, _) = range[i];
-                if entry_size >= &size {
-                    // we could fit the value in this one entry
-                    let atime = unsafe {
-                        let ptr = self.slab.offset(*offset as isize);
-                        let entry: &Entry<K, ()> = mem::transmute(ptr);
-                        // we clone since `Instance` is two words
-                        entry.atime.lock().clone()
-                    };
-                    candidates.insert(atime, vec![*offset]);
-                } else {
-                    // we need to group up multiple entries to see
-                    // what can be thrown out.
-                    panic!();
+            // all the allocations in a range are adjacent and writelocked
+            'range: for i in 0..range.len() {
+                let mut check = i;
+                let mut elapsed_times = vec![];
+                let mut offsets = vec![];
+                let mut full_size = 0;
+                let mut last_end = None;
+                // select n slots to evict to make enough room for `size`
+                loop {
+                    match range.get(check) {
+                        None => break 'range,
+                        Some(&(entry_offset, entry_size, _)) => {
+                            elapsed_times.push(unsafe {
+                                let ptr =
+                                    self.slab.offset(*entry_offset as isize);
+                                let entry: &Entry<K, ()> = mem::transmute(ptr);
+                                entry.atime.read().elapsed()
+                            });
+                            match last_end {
+                                Some(n) => {
+                                    // add empty space after last entry
+                                    println!(
+                                        "n {}, entry_offset {}",
+                                        n,
+                                        entry_offset
+                                    );
+                                    full_size += entry_offset - n;
+                                }
+                                None => (),
+                            }
+
+                            offsets.push(*entry_offset);
+                            full_size += *entry_size;
+                            last_end = Some(entry_offset + entry_size);
+
+                            if full_size >= size {
+                                let mut elapsed = elapsed_times.iter().fold(
+                                    Duration::from_millis(0),
+                                    |a, b| a + *b,
+                                );
+                                elapsed /= elapsed_times.len() as u32;
+
+                                candidates.insert(elapsed, offsets);
+                                break;
+                            }
+                        }
+                    }
+                    check += 1;
                 }
             }
         }
 
         candidates
             .iter_mut()
-            .next()
+            // pick out oldest value
+            .last()
             .map(|(_, val)| mem::replace(val, vec![]))
     }
 
@@ -301,7 +346,7 @@ impl<K: Hash + Eq + fmt::Debug> Cache<K> {
                 println!("entry at {}\n{:?}", offset, entry);
 
                 if &entry.key == key {
-                    *entry.atime.lock() = Instant::now();
+                    *entry.atime.write() = Instant::now();
                     return Some(Reference::Cached {
                         guard: entry.lock.read(),
                         ptr: &entry.val,
@@ -362,25 +407,68 @@ mod tests {
         }
     }
 
-    // #[test]
-    // fn evict_multiple() {
-    //     let cache = Cache::new(4096);
+    #[test]
+    fn evict_multiple() {
+        let cache = Cache::new(4096);
 
-    //     // first fill cache with small values
-    //     let n: usize = 1000;
-    //     for i in 0..n {
-    //         assert_eq!(*cache.insert(i, i), i);
-    //         let gotten = cache.get::<usize>(&i);
-    //         assert_eq!(*gotten.unwrap(), i);
-    //     }
+        // first fill cache with small values
+        let n: usize = 1000;
+        for i in 0..n {
+            assert_eq!(*cache.insert(i, i), i);
+            let gotten = cache.get::<usize>(&i);
+            assert_eq!(*gotten.unwrap(), i);
+        }
 
-    //     // then evict them with larger
-    //     let n: usize = 1_000;
-    //     for i in 0..n {
-    //         let block = [i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i];
-    //         assert_eq!(*cache.insert(i, block.clone()), block.clone());
-    //         let gotten = cache.get::<[usize; 16]>(&i);
-    //         assert_eq!(*gotten.unwrap(), block);
-    //     }
-    // }
+        // then evict them with larger
+        let n2: usize = 1_000;
+        for i in 0..n2 {
+            let block = [i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i];
+            assert_eq!(*cache.insert(i + n, block.clone()), block.clone());
+            let gotten = cache.get::<[usize; 16]>(&(i + n));
+            assert_eq!(*gotten.unwrap(), block);
+        }
+        // 0 should have fallen out by now!
+        assert!(cache.get::<usize>(&0).is_none());
+    }
+
+    #[test]
+    fn evict_multiple_keepalive() {
+        let cache = Cache::new(4096);
+
+        cache.insert(0usize, 0usize);
+
+        // then evict them with larger
+        let n: usize = 1_000;
+        for i in 1..n + 1 {
+            let block = [i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i];
+            assert_eq!(*cache.insert(i, block.clone()), block.clone());
+            let gotten = cache.get::<[usize; 16]>(&i);
+            assert_eq!(*gotten.unwrap(), block);
+            let _keepalive = cache.get::<usize>(&0);
+        }
+        // 0 should have been kept alive!
+        assert_eq!(*cache.get::<usize>(&0).unwrap(), 0);
+    }
+
+    #[test]
+    fn big_then_small() {
+        let cache = Cache::new(4096);
+
+        // first fill cache with large values
+        let n: usize = 1_000;
+        for i in 0..n {
+            let block = [i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i];
+            assert_eq!(*cache.insert(i, block.clone()), block.clone());
+            let gotten = cache.get::<[usize; 16]>(&i);
+            assert_eq!(*gotten.unwrap(), block);
+        }
+
+        // then evict them with smaller
+        let n2: usize = 1000;
+        for i in 0..n2 {
+            assert_eq!(*cache.insert(i + n, i), i);
+            let gotten = cache.get::<usize>(&(i + n));
+            assert_eq!(*gotten.unwrap(), i);
+        }
+    }
 }

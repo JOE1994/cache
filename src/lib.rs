@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 use std::marker::PhantomData;
 use std::hash::{Hash, Hasher};
 use std::{fmt, mem, ptr};
+use std::any::TypeId;
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use seahash::SeaHasher;
 
-const WORDSIZE: usize = 8;
+const ALIGNMENT: usize = 8;
 const TRIES: usize = 8;
 
 // We use `repr(C)` here, since rust does not currently guarantee field order,
@@ -22,30 +23,32 @@ struct Entry<K, V> {
     key: K,
     lock: RwLock<()>,
     atime: RwLock<Instant>,
+    type_id: TypeId,
     // val is of arbitrary size, and has to be on the end
     // to access the other fields with V erased
     val: V,
 }
 
-impl<K, V> Entry<K, V> {
+impl<K, V: 'static> Entry<K, V> {
     fn new(key: K, val: V) -> Self {
         Entry {
             key,
             val,
+            type_id: TypeId::of::<V>(),
             atime: RwLock::new(Instant::now()),
             lock: RwLock::new(()),
         }
     }
 
-    // size of entry rounded up to nearest usize multiple
+    // size of entry rounded up to nearest alignment
     fn size() -> usize {
         let size = mem::size_of::<Self>();
-        let overlap = size % WORDSIZE;
-        let mut size = size / WORDSIZE;
+        let overlap = size % ALIGNMENT;
+        let mut size = size / ALIGNMENT;
         if overlap != 0 {
             size += 1;
         }
-        size * WORDSIZE
+        size * ALIGNMENT
     }
 }
 
@@ -56,10 +59,15 @@ pub struct Page<K> {
     _marker: PhantomData<K>,
 }
 
-unsafe impl<K> Send for Page<K> {}
-unsafe impl<K> Sync for Page<K> {}
+type Destructors = BTreeMap<TypeId, Box<Fn(*const u8)>>;
 
-pub struct Cache<K>(Vec<Page<K>>);
+pub struct Cache<K> {
+    pages: Vec<Page<K>>,
+    destructors: RwLock<Destructors>,
+}
+
+unsafe impl<K> Send for Cache<K> {}
+unsafe impl<K> Sync for Cache<K> {}
 
 impl<K: Hash + Eq> Cache<K> {
     pub fn new(num_pages: usize, page_size: usize) -> Self {
@@ -68,7 +76,10 @@ impl<K: Hash + Eq> Cache<K> {
         for _ in 0..num_pages {
             pages.push(Page::new(page_size))
         }
-        Cache(pages)
+        Cache {
+            pages,
+            destructors: RwLock::new(BTreeMap::new()),
+        }
     }
 
     fn hash(key: &K) -> u64 {
@@ -77,16 +88,29 @@ impl<K: Hash + Eq> Cache<K> {
         hasher.finish()
     }
 
-    pub fn insert<V: Sized>(&self, key: K, val: V) -> Reference<V> {
+    pub fn insert<V: Sized + 'static>(&self, key: K, val: V) -> Reference<V> {
         let hash = Self::hash(&key);
-        let page = hash as usize % self.0.len();
-        self.0[page].insert(hash, key, val)
+        let page = hash as usize % self.pages.len();
+        let type_id = TypeId::of::<V>();
+        // cache a destructor for this value if not already cached
+        if self.destructors.read().get(&type_id).is_none() {
+            println!("inserting type {:?}", type_id);
+            self.destructors.write().insert(
+                type_id,
+                Box::new(|addr| unsafe {
+                    let ptr: *const V = mem::transmute(addr);
+                    println!("read ptr {:?}", ptr);
+                    let _ = ptr::read(ptr);
+                }),
+            );
+        }
+        self.pages[page].insert(hash, key, val, &*self.destructors.read())
     }
 
-    pub fn get<'a, V: 'a>(&'a self, key: &K) -> Option<Reference<'a, V>> {
+    pub fn get<'a, V: 'static>(&'a self, key: &K) -> Option<Reference<'a, V>> {
         let hash = Self::hash(&key);
-        let page = hash as usize % self.0.len();
-        self.0[page].get(hash, key)
+        let page = hash as usize % self.pages.len();
+        self.pages[page].get(hash, key)
     }
 }
 
@@ -134,10 +158,9 @@ impl<K: Hash + Eq> Page<K> {
         }
     }
 
-    fn offset<V: Sized>(&self, hash: u64) -> usize {
+    fn offset<V: Sized + 'static>(&self, hash: u64) -> usize {
         let size = Entry::<K, V>::size();
-        // TODO check if wraparound / page alignment is neccesary...
-        let offset = (hash as usize % (self.size / WORDSIZE)) * WORDSIZE;
+        let offset = (hash as usize % (self.size / ALIGNMENT)) * ALIGNMENT;
         if offset + size > self.size {
             // wraparound
             0
@@ -146,7 +169,13 @@ impl<K: Hash + Eq> Page<K> {
         }
     }
 
-    pub fn insert<V: Sized>(&self, hash: u64, key: K, val: V) -> Reference<V> {
+    pub fn insert<V: Sized + 'static>(
+        &self,
+        hash: u64,
+        key: K,
+        val: V,
+        destructors: &Destructors,
+    ) -> Reference<V> {
         let size = Entry::<K, V>::size();
         let orig_offset = self.offset::<V>(hash);
         let mut offset = orig_offset;
@@ -204,6 +233,7 @@ impl<K: Hash + Eq> Page<K> {
                 unsafe {
                     let ptr = self.slab.offset(found as isize);
                     let ptr: *mut Entry<K, V> = mem::transmute(ptr);
+                    println!("write ptr {:?}", ptr);
                     ptr::write(ptr, entry);
                     let vptr = &(*ptr).val;
                     let guard = (*ptr).lock.read();
@@ -212,11 +242,19 @@ impl<K: Hash + Eq> Page<K> {
                 }
             } else {
                 match self.evict(orig_offset, size, &mut allocations) {
-                    Some(offsets) => {
-                        for offset in &offsets {
+                    Some(evict) => {
+                        for &(offset, type_id) in &evict {
+                            // run destructor and deallocate
+                            unsafe {
+                                println!("destroying {:?}", type_id);
+                                let ptr = self.slab.offset(offset as isize);
+                                destructors
+                                    .get(&type_id)
+                                    .expect("No destructor for type")(ptr);
+                            }
                             allocations.remove(&offset);
                         }
-                        found = Some(*offsets.first().expect("len > 1"));
+                        found = Some(evict.first().expect("len > 1").0);
                     }
                     None => {
                         return Reference::Spilled(val);
@@ -231,7 +269,7 @@ impl<K: Hash + Eq> Page<K> {
         from: usize,
         size: usize,
         allocations: &mut RwLockWriteGuard<BTreeMap<usize, usize>>,
-    ) -> Option<Vec<usize>> {
+    ) -> Option<Vec<(usize, TypeId)>> {
         let mut ranges = vec![];
         let mut adjacent = vec![];
         {
@@ -274,7 +312,7 @@ impl<K: Hash + Eq> Page<K> {
             'range: for i in 0..range.len() {
                 let mut check = i;
                 let mut elapsed_times = vec![];
-                let mut offsets = vec![];
+                let mut elements = vec![];
                 let mut full_size = 0;
                 let mut last_end = None;
                 // select n slots to evict to make enough room for `size`
@@ -282,26 +320,23 @@ impl<K: Hash + Eq> Page<K> {
                     match range.get(check) {
                         None => break 'range,
                         Some(&(entry_offset, entry_size, _)) => {
+                            let type_id;
                             elapsed_times.push(unsafe {
                                 let ptr =
                                     self.slab.offset(*entry_offset as isize);
                                 let entry: &Entry<K, ()> = mem::transmute(ptr);
+                                type_id = entry.type_id;
                                 entry.atime.read().elapsed()
                             });
                             match last_end {
                                 Some(n) => {
-                                    // add empty space after last entry
-                                    println!(
-                                        "n {}, entry_offset {}",
-                                        n,
-                                        entry_offset
-                                    );
+                                    // empty space after last entry
                                     full_size += entry_offset - n;
                                 }
                                 None => (),
                             }
 
-                            offsets.push(*entry_offset);
+                            elements.push((*entry_offset, type_id));
                             full_size += *entry_size;
                             last_end = Some(entry_offset + entry_size);
 
@@ -312,7 +347,7 @@ impl<K: Hash + Eq> Page<K> {
                                 );
                                 elapsed /= elapsed_times.len() as u32;
 
-                                candidates.insert(elapsed, offsets);
+                                candidates.insert(elapsed, elements);
                                 break;
                             }
                         }
@@ -329,7 +364,7 @@ impl<K: Hash + Eq> Page<K> {
             .map(|(_, val)| mem::replace(val, vec![]))
     }
 
-    pub fn get<'a, V: 'a>(
+    pub fn get<'a, V: 'static>(
         &'a self,
         hash: u64,
         key: &K,
@@ -393,6 +428,29 @@ mod tests {
         }
         // 0 should have been kept alive!
         assert_eq!(*cache.get::<usize>(&0).unwrap(), 0);
+    }
+
+
+    #[test]
+    fn destructors() {
+        let cache = Cache::new(1, 4096);
+
+        let arc = Arc::new(42usize);
+
+        println!("arc");
+        cache.insert(0, arc.clone());
+        assert_eq!(Arc::strong_count(&arc), 2);
+
+        let n: usize = 10_000;
+
+        // spam usizes to make arc fall out
+        for i in 1..n {
+            cache.insert(i, i);
+        }
+        // arc should have fallen out
+        assert!(cache.get::<Arc<usize>>(&0).is_none());
+        // and had its destructor run
+        assert_eq!(Arc::strong_count(&arc), 1);
     }
 
     #[test]

@@ -21,7 +21,7 @@ use seahash::SeaHasher;
 const ALIGNMENT: usize = 8;
 const TRIES: usize = 8;
 
-fn wrap_drop<V: fmt::Debug>(ptr: *const ManuallyDrop<u8>) {
+fn wrap_drop<V>(ptr: *const ManuallyDrop<u8>) {
     unsafe {
         let ptr: &mut ManuallyDrop<V> = mem::transmute(ptr);
         ManuallyDrop::drop(ptr);
@@ -41,7 +41,7 @@ struct Entry<K, V> {
     val: ManuallyDrop<V>,
 }
 
-impl<K, V: 'static + fmt::Debug> Entry<K, V> {
+impl<K, V: 'static> Entry<K, V> {
     fn new(key: K, val: V) -> Self {
         let val = ManuallyDrop::new(val);
         Entry {
@@ -111,7 +111,7 @@ impl<K: Hash + Eq> Cache<K> {
     ///
     /// *NOTE* If you insert different values under the same key, you will only
     /// get one of them out again. Updates are not possible.
-    pub fn insert<V: 'static + fmt::Debug>(
+    pub fn insert<V: 'static>(
         &self,
         key: K,
         val: V,
@@ -122,7 +122,7 @@ impl<K: Hash + Eq> Cache<K> {
     }
 
     /// Is this value in the cache?
-    pub fn get<'a, V: 'static + fmt::Debug>(
+    pub fn get<'a, V: 'static>(
         &'a self,
         key: &K,
     ) -> Option<Reference<'a, V>> {
@@ -182,7 +182,7 @@ impl<K: Hash + Eq> Page<K> {
         }
     }
 
-    fn offset<V: 'static + fmt::Debug>(&self, hash: u64) -> usize {
+    fn offset<V: 'static>(&self, hash: u64) -> usize {
         let size = Entry::<K, V>::size();
         let offset = (hash as usize % (self.size / ALIGNMENT)) * ALIGNMENT;
         if offset + size > self.size {
@@ -193,7 +193,7 @@ impl<K: Hash + Eq> Page<K> {
         }
     }
 
-    pub fn insert<V: 'static + fmt::Debug>(
+    pub fn insert<V: 'static>(
         &self,
         hash: u64,
         key: K,
@@ -382,7 +382,7 @@ impl<K: Hash + Eq> Page<K> {
             .map(|(_, val)| mem::replace(val, vec![]))
     }
 
-    pub fn get<'a, V: 'static + fmt::Debug>(
+    pub fn get<'a, V: 'static>(
         &'a self,
         hash: u64,
         key: &K,

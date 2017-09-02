@@ -7,14 +7,21 @@ use std::ops::Deref;
 use std::time::{Duration, Instant};
 use std::marker::PhantomData;
 use std::hash::{Hash, Hasher};
-use std::{fmt, mem, ptr};
-use std::any::TypeId;
+use std::mem::{self, ManuallyDrop};
+use std::{fmt, ptr};
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use seahash::SeaHasher;
 
 const ALIGNMENT: usize = 8;
 const TRIES: usize = 8;
+
+fn wrap_drop<V: fmt::Debug>(ptr: *const ManuallyDrop<u8>) {
+    unsafe {
+        let ptr: &mut ManuallyDrop<V> = mem::transmute(ptr);
+        ManuallyDrop::drop(ptr);
+    }
+}
 
 // We use `repr(C)` here, since rust does not currently guarantee field order,
 // and we must be able to read the non-val fields in a type-erased way
@@ -23,18 +30,19 @@ struct Entry<K, V> {
     key: K,
     lock: RwLock<()>,
     atime: RwLock<Instant>,
-    type_id: TypeId,
+    destructor: Box<Fn(*const ManuallyDrop<u8>)>,
     // val is of arbitrary size, and has to be on the end
     // to access the other fields with V erased
-    val: V,
+    val: ManuallyDrop<V>,
 }
 
-impl<K, V: 'static> Entry<K, V> {
+impl<K, V: 'static + fmt::Debug> Entry<K, V> {
     fn new(key: K, val: V) -> Self {
+        let val = ManuallyDrop::new(val);
         Entry {
             key,
             val,
-            type_id: TypeId::of::<V>(),
+            destructor: Box::new(wrap_drop::<V>),
             atime: RwLock::new(Instant::now()),
             lock: RwLock::new(()),
         }
@@ -59,11 +67,8 @@ pub struct Page<K> {
     _marker: PhantomData<K>,
 }
 
-type Destructors = BTreeMap<TypeId, Box<Fn(*const u8)>>;
-
 pub struct Cache<K> {
     pages: Vec<Page<K>>,
-    destructors: RwLock<Destructors>,
 }
 
 unsafe impl<K> Send for Cache<K> {}
@@ -76,10 +81,7 @@ impl<K: Hash + Eq> Cache<K> {
         for _ in 0..num_pages {
             pages.push(Page::new(page_size))
         }
-        Cache {
-            pages,
-            destructors: RwLock::new(BTreeMap::new()),
-        }
+        Cache { pages }
     }
 
     fn hash(key: &K) -> u64 {
@@ -88,26 +90,20 @@ impl<K: Hash + Eq> Cache<K> {
         hasher.finish()
     }
 
-    pub fn insert<V: Sized + 'static>(&self, key: K, val: V) -> Reference<V> {
+    pub fn insert<V: 'static + fmt::Debug>(
+        &self,
+        key: K,
+        val: V,
+    ) -> Reference<V> {
         let hash = Self::hash(&key);
         let page = hash as usize % self.pages.len();
-        let type_id = TypeId::of::<V>();
-        // cache a destructor for this value if not already cached
-        if self.destructors.read().get(&type_id).is_none() {
-            println!("inserting type {:?}", type_id);
-            self.destructors.write().insert(
-                type_id,
-                Box::new(|addr| unsafe {
-                    let ptr: *const V = mem::transmute(addr);
-                    println!("read ptr {:?}", ptr);
-                    let _ = ptr::read(ptr);
-                }),
-            );
-        }
-        self.pages[page].insert(hash, key, val, &*self.destructors.read())
+        self.pages[page].insert(hash, key, val)
     }
 
-    pub fn get<'a, V: 'static>(&'a self, key: &K) -> Option<Reference<'a, V>> {
+    pub fn get<'a, V: 'static + fmt::Debug>(
+        &'a self,
+        key: &K,
+    ) -> Option<Reference<'a, V>> {
         let hash = Self::hash(&key);
         let page = hash as usize % self.pages.len();
         self.pages[page].get(hash, key)
@@ -118,7 +114,7 @@ pub enum Reference<'a, V> {
     Spilled(V),
     Cached {
         guard: RwLockReadGuard<'a, ()>,
-        ptr: *const V,
+        ptr: *const ManuallyDrop<V>,
     },
 }
 
@@ -158,7 +154,7 @@ impl<K: Hash + Eq> Page<K> {
         }
     }
 
-    fn offset<V: Sized + 'static>(&self, hash: u64) -> usize {
+    fn offset<V: 'static + fmt::Debug>(&self, hash: u64) -> usize {
         let size = Entry::<K, V>::size();
         let offset = (hash as usize % (self.size / ALIGNMENT)) * ALIGNMENT;
         if offset + size > self.size {
@@ -169,12 +165,11 @@ impl<K: Hash + Eq> Page<K> {
         }
     }
 
-    pub fn insert<V: Sized + 'static>(
+    pub fn insert<V: 'static + fmt::Debug>(
         &self,
         hash: u64,
         key: K,
         val: V,
-        destructors: &Destructors,
     ) -> Reference<V> {
         let size = Entry::<K, V>::size();
         let orig_offset = self.offset::<V>(hash);
@@ -233,24 +228,19 @@ impl<K: Hash + Eq> Page<K> {
                 unsafe {
                     let ptr = self.slab.offset(found as isize);
                     let ptr: *mut Entry<K, V> = mem::transmute(ptr);
-                    println!("write ptr {:?}", ptr);
                     ptr::write(ptr, entry);
                     let vptr = &(*ptr).val;
                     let guard = (*ptr).lock.read();
-
                     return Reference::Cached { ptr: vptr, guard };
                 }
             } else {
                 match self.evict(orig_offset, size, &mut allocations) {
                     Some(evict) => {
-                        for &(offset, type_id) in &evict {
+                        for &(offset, ref destructor) in &evict {
                             // run destructor and deallocate
                             unsafe {
-                                println!("destroying {:?}", type_id);
-                                let ptr = self.slab.offset(offset as isize);
-                                destructors
-                                    .get(&type_id)
-                                    .expect("No destructor for type")(ptr);
+                                let entry: &Entry<K, u8> = mem::transmute(self.slab.offset(offset as isize));
+                                destructor(&entry.val);
                             }
                             allocations.remove(&offset);
                         }
@@ -269,7 +259,7 @@ impl<K: Hash + Eq> Page<K> {
         from: usize,
         size: usize,
         allocations: &mut RwLockWriteGuard<BTreeMap<usize, usize>>,
-    ) -> Option<Vec<(usize, TypeId)>> {
+    ) -> Option<Vec<(usize, &Box<Fn(*const ManuallyDrop<u8>)>)>> {
         let mut ranges = vec![];
         let mut adjacent = vec![];
         {
@@ -320,12 +310,12 @@ impl<K: Hash + Eq> Page<K> {
                     match range.get(check) {
                         None => break 'range,
                         Some(&(entry_offset, entry_size, _)) => {
-                            let type_id;
+                            let destructor;
                             elapsed_times.push(unsafe {
                                 let ptr =
                                     self.slab.offset(*entry_offset as isize);
                                 let entry: &Entry<K, ()> = mem::transmute(ptr);
-                                type_id = entry.type_id;
+                                destructor = &entry.destructor;
                                 entry.atime.read().elapsed()
                             });
                             match last_end {
@@ -336,7 +326,7 @@ impl<K: Hash + Eq> Page<K> {
                                 None => (),
                             }
 
-                            elements.push((*entry_offset, type_id));
+                            elements.push((*entry_offset, destructor));
                             full_size += *entry_size;
                             last_end = Some(entry_offset + entry_size);
 
@@ -364,7 +354,7 @@ impl<K: Hash + Eq> Page<K> {
             .map(|(_, val)| mem::replace(val, vec![]))
     }
 
-    pub fn get<'a, V: 'static>(
+    pub fn get<'a, V: 'static + fmt::Debug>(
         &'a self,
         hash: u64,
         key: &K,
@@ -437,7 +427,6 @@ mod tests {
 
         let arc = Arc::new(42usize);
 
-        println!("arc");
         cache.insert(0, arc.clone());
         assert_eq!(Arc::strong_count(&arc), 2);
 

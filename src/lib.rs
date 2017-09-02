@@ -14,6 +14,7 @@ use std::marker::PhantomData;
 use std::hash::{Hash, Hasher};
 use std::mem::{self, ManuallyDrop};
 use std::{fmt, ptr};
+use std::any::TypeId;
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use seahash::SeaHasher;
@@ -36,6 +37,7 @@ struct Entry<K, V> {
     lock: RwLock<()>,
     atime: RwLock<Instant>,
     destructor: fn(*const ManuallyDrop<u8>),
+    type_id: TypeId,
     // val is of arbitrary size, and has to be on the end
     // to access the other fields with V erased
     val: ManuallyDrop<V>,
@@ -50,6 +52,7 @@ impl<K, V: 'static> Entry<K, V> {
             destructor: wrap_drop::<V>,
             atime: RwLock::new(Instant::now()),
             lock: RwLock::new(()),
+            type_id: TypeId::of::<V>(),
         }
     }
 
@@ -397,7 +400,8 @@ impl<K: Hash + Eq> Page<K> {
                 let ptr = self.slab.offset(*offset as isize);
                 let entry: &Entry<K, V> = mem::transmute(ptr);
 
-                if &entry.key == key {
+                // make sure the type is right
+                if entry.type_id == TypeId::of::<V>() && &entry.key == key {
                     *entry.atime.write() = Instant::now();
                     return Some(Reference::Cached {
                         guard: entry.lock.read(),
@@ -582,5 +586,15 @@ mod tests {
             let gotten = cache.get::<usize>(&(i + n));
             assert_eq!(*gotten.unwrap(), i);
         }
+    }
+
+    #[test]
+    fn wrong_type() {
+        let cache = Cache::new(1, 4096);
+
+        cache.insert(0usize, 0usize);
+
+        assert!(cache.get::<u32>(&0).is_none());
+        assert!(cache.get::<usize>(&0).is_some());
     }
 }

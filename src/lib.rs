@@ -35,7 +35,7 @@ struct Entry<K, V> {
     key: K,
     lock: RwLock<()>,
     atime: RwLock<Instant>,
-    destructor: Box<Fn(*const ManuallyDrop<u8>)>,
+    destructor: fn(*const ManuallyDrop<u8>),
     // val is of arbitrary size, and has to be on the end
     // to access the other fields with V erased
     val: ManuallyDrop<V>,
@@ -47,7 +47,7 @@ impl<K, V: 'static> Entry<K, V> {
         Entry {
             key,
             val,
-            destructor: Box::new(wrap_drop::<V>),
+            destructor: wrap_drop::<V>,
             atime: RwLock::new(Instant::now()),
             lock: RwLock::new(()),
         }
@@ -81,12 +81,12 @@ unsafe impl<K> Send for Cache<K> {}
 unsafe impl<K> Sync for Cache<K> {}
 
 impl<K: Hash + Eq> Cache<K> {
-    /// Create a new cache setting page size and numbr of pages.
+    /// Create a new cache setting page size and number of pages.
     ///
-    /// The page size determines the maximum size of values that can be
+    /// `page_size` determines the maximum size of values that can be
     /// stored in the cache.
     ///
-    /// The num pages determines how many slabs of memory of this size should be
+    /// `num pages` determines how many slabs of memory of this size should be
     /// allocated.
     ///
     /// Each page has its own read-write lock, so the more pages you have,
@@ -287,7 +287,7 @@ impl<K: Hash + Eq> Page<K> {
         from: usize,
         size: usize,
         allocations: &mut RwLockWriteGuard<BTreeMap<usize, usize>>,
-    ) -> Option<Vec<(usize, &Box<Fn(*const ManuallyDrop<u8>)>)>> {
+    ) -> Option<Vec<(usize, &fn(*const ManuallyDrop<u8>))>> {
         let mut ranges = vec![];
         let mut adjacent = vec![];
         {

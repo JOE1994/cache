@@ -108,6 +108,9 @@ impl<K: Hash + Eq> Cache<K> {
 
     /// Insert a value `V` into cache with key `K`, returns a `Reference` to
     /// the newly stored or spilled value
+    ///
+    /// *NOTE* If you insert different values under the same key, you will only
+    /// get one of them out again. Updates are not possible.
     pub fn insert<V: 'static + fmt::Debug>(
         &self,
         key: K,

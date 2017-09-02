@@ -1,3 +1,8 @@
+//! In-memory fixed-size cache for arbitrary types.
+//!
+//! Primarily intended for content-addressable storage, where the key uniquely
+//! identifies a value.
+#![deny(missing_docs)]
 extern crate parking_lot;
 extern crate seahash;
 extern crate stable_heap;
@@ -60,13 +65,14 @@ impl<K, V: 'static + fmt::Debug> Entry<K, V> {
     }
 }
 
-pub struct Page<K> {
+struct Page<K> {
     allocations: RwLock<BTreeMap<usize, usize>>,
     size: usize,
     slab: *mut u8,
     _marker: PhantomData<K>,
 }
 
+/// A thread-safe concurrent cache from key `K` to arbitrarily typed values
 pub struct Cache<K> {
     pages: Vec<Page<K>>,
 }
@@ -75,6 +81,16 @@ unsafe impl<K> Send for Cache<K> {}
 unsafe impl<K> Sync for Cache<K> {}
 
 impl<K: Hash + Eq> Cache<K> {
+    /// Create a new cache setting page size and numbr of pages.
+    ///
+    /// The page size determines the maximum size of values that can be
+    /// stored in the cache.
+    ///
+    /// The num pages determines how many slabs of memory of this size should be
+    /// allocated.
+    ///
+    /// Each page has its own read-write lock, so the more pages you have,
+    /// the less likely you are to have lock contention.
     pub fn new(num_pages: usize, page_size: usize) -> Self {
         assert!(num_pages > 0, "Must have at least one page");
         let mut pages = Vec::with_capacity(num_pages);
@@ -90,6 +106,8 @@ impl<K: Hash + Eq> Cache<K> {
         hasher.finish()
     }
 
+    /// Insert a value `V` into cache with key `K`, returns a `Reference` to
+    /// the newly stored or spilled value
     pub fn insert<V: 'static + fmt::Debug>(
         &self,
         key: K,
@@ -100,6 +118,7 @@ impl<K: Hash + Eq> Cache<K> {
         self.pages[page].insert(hash, key, val)
     }
 
+    /// Is this value in the cache?
     pub fn get<'a, V: 'static + fmt::Debug>(
         &'a self,
         key: &K,
@@ -110,10 +129,16 @@ impl<K: Hash + Eq> Cache<K> {
     }
 }
 
+/// A reference type to a value in the cache, either carrying the value
+/// itself (if an insert failed), or a readlock into the memory slab.
 pub enum Reference<'a, V> {
+    /// Value could not be put on the cache, and is returned as-is
     Spilled(V),
+    /// Value resides in cache and is read-locked.
     Cached {
+        /// The readguard from a lock on the heap
         guard: RwLockReadGuard<'a, ()>,
+        /// A pointer to a value on the heap
         ptr: *const ManuallyDrop<V>,
     },
 }

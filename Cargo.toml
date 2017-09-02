@@ -1,6 +1,10 @@
 [package]
 authors = ["Kristoffer Ström <kristoffer@rymdkoloni.se>"]
-name = "testz"
+description = "Type agnostic, fixed-size cache"
+documentation = "https://krl.github.io/cache/doc/cache/index.html"
+repository = "https://github.com/krl/cache"
+license = "GPL-3.0"
+name = "cache"
 version = "0.1.0"
 
 [dependencies]

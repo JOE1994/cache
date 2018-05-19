@@ -6,6 +6,7 @@
 extern crate parking_lot;
 extern crate seahash;
 extern crate stable_heap;
+extern crate owning_ref;
 
 use std::collections::BTreeMap;
 use std::ops::Deref;
@@ -18,6 +19,7 @@ use std::any::TypeId;
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use seahash::SeaHasher;
+use owning_ref::StableAddress;
 
 const ALIGNMENT: usize = 8;
 const TRIES: usize = 8;
@@ -109,7 +111,7 @@ impl<K: Hash + Eq> Cache<K> {
         hasher.finish()
     }
 
-    /// Insert a value `V` into cache with key `K`, returns a `Reference` to
+    /// Insert a value `V` into cache with key `K`, returns a `Cached` to
     /// the newly stored or spilled value
     ///
     /// *NOTE* If you insert different values under the same key, you will only
@@ -118,7 +120,7 @@ impl<K: Hash + Eq> Cache<K> {
         &self,
         key: K,
         val: V,
-    ) -> Reference<V> {
+    ) -> Cached<V> {
         let hash = Self::hash(&key);
         let page = hash as usize % self.pages.len();
         self.pages[page].insert(hash, key, val)
@@ -128,7 +130,7 @@ impl<K: Hash + Eq> Cache<K> {
     pub fn get<'a, V: 'static>(
         &'a self,
         key: &K,
-    ) -> Option<Reference<'a, V>> {
+    ) -> Option<Cached<'a, V>> {
         let hash = Self::hash(&key);
         let page = hash as usize % self.pages.len();
         self.pages[page].get(hash, key)
@@ -137,9 +139,10 @@ impl<K: Hash + Eq> Cache<K> {
 
 /// A reference type to a value in the cache, either carrying the value
 /// itself (if an insert failed), or a readlock into the memory slab.
-pub enum Reference<'a, V> {
-    /// Value could not be put on the cache, and is returned as-is
-    Spilled(V),
+pub enum Cached<'a, V: 'a> {
+    /// Value could not be put on the cache, and is returned in a box
+    /// as to be able to implement `StableDeref`
+    Spilled(Box<V>),
     /// Value resides in cache and is read-locked.
     Cached {
         /// The readguard from a lock on the heap
@@ -147,28 +150,58 @@ pub enum Reference<'a, V> {
         /// A pointer to a value on the heap
         ptr: *const ManuallyDrop<V>,
     },
+    /// A value that was borrowed from outside the cache.
+    Borrowed(&'a V),
 }
 
-impl<'a, V> fmt::Debug for Reference<'a, V>
-where
-    V: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Reference::Spilled(ref v) => write!(f, "Spilled({:?})", v),
-            Reference::Cached { ptr, .. } => {
-                write!(f, "Cached({:?})", unsafe { &*ptr })
+unsafe impl<'a, V> StableAddress for Cached<'a, V> {}
+
+impl<'a, V: 'a> Cached<'a, V> {
+    /// Borrow a value from outside the cache
+    pub fn borrowed(val: &'a V) -> Self {
+        Cached::Borrowed(val)
+    }
+}
+
+impl<'a, V: 'a + Clone> Cached<'a, V> {
+    /// Turns the cached value into an owned value by cloning
+    pub fn into_owned(self) -> V {
+        match self {
+            Cached::Spilled(v) => (*v).clone(),
+            Cached::Cached { ptr, .. } => {
+                (unsafe { &*ptr }.deref()).clone()
+            }
+            Cached::Borrowed(v) => {
+                v.clone()
             }
         }
     }
 }
 
-impl<'a, V> Deref for Reference<'a, V> {
+impl<'a, V> fmt::Debug for Cached<'a, V>
+where
+    V: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Cached::Spilled(ref v) => write!(f, "Spilled({:?})", v),
+            Cached::Cached { ptr, .. } => {
+                write!(f, "Cached({:?})", unsafe { &*ptr })
+            }
+            Cached::Borrowed(v) => {
+                write!(f, "Borrowed({:?})", v)
+            }
+        }
+    }
+}
+
+impl<'a, V> Deref for Cached<'a, V> {
     type Target = V;
     fn deref(&self) -> &V {
         match *self {
-            Reference::Spilled(ref v) => v,
-            Reference::Cached { ptr, .. } => unsafe { &*ptr },
+            Cached::Spilled(ref v) => v,
+            Cached::Cached { ptr, .. } => unsafe { &*ptr },
+            Cached::Borrowed(v) => v,
         }
     }
 }
@@ -201,7 +234,7 @@ impl<K: Hash + Eq> Page<K> {
         hash: u64,
         key: K,
         val: V,
-    ) -> Reference<V> {
+    ) -> Cached<V> {
         let size = Entry::<K, V>::size();
         let orig_offset = self.offset::<V>(hash);
         let mut offset = orig_offset;
@@ -262,7 +295,7 @@ impl<K: Hash + Eq> Page<K> {
                     ptr::write(ptr, entry);
                     let vptr = &(*ptr).val;
                     let guard = (*ptr).lock.read();
-                    return Reference::Cached { ptr: vptr, guard };
+                    return Cached::Cached { ptr: vptr, guard };
                 }
             } else {
                 match self.evict(orig_offset, size, &mut allocations) {
@@ -278,7 +311,7 @@ impl<K: Hash + Eq> Page<K> {
                         found = Some(evict.first().expect("len > 1").0);
                     }
                     None => {
-                        return Reference::Spilled(val);
+                        return Cached::Spilled(Box::new(val));
                     }
                 }
             }
@@ -389,7 +422,7 @@ impl<K: Hash + Eq> Page<K> {
         &'a self,
         hash: u64,
         key: &K,
-    ) -> Option<Reference<'a, V>> {
+    ) -> Option<Cached<'a, V>> {
         let offset = self.offset::<V>(hash);
         let allocations = self.allocations.read();
 
@@ -403,7 +436,7 @@ impl<K: Hash + Eq> Page<K> {
                 // make sure the type is right
                 if entry.type_id == TypeId::of::<V>() && &entry.key == key {
                     *entry.atime.write() = Instant::now();
-                    return Some(Reference::Cached {
+                    return Some(Cached::Cached {
                         guard: entry.lock.read(),
                         ptr: &entry.val,
                     });

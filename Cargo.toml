@@ -2,12 +2,13 @@
 authors = ["Kristoffer Ström <kristoffer@rymdkoloni.se>"]
 description = "Type agnostic, fixed-size cache"
 documentation = "https://krl.github.io/rustdoc/cache/cache/index.html"
-repository = "https://github.com/krl/cache"
 license = "GPL-3.0"
 name = "cache"
+repository = "https://github.com/krl/cache"
 version = "0.1.4"
 
 [dependencies]
+owning_ref = "0.3.3"
 parking_lot = "0.4.5"
 seahash = "3.0.5"
 stable-heap = "0.1.0"

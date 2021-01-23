@@ -82,8 +82,8 @@ pub struct Cache<K> {
     pages: Vec<Page<K>>,
 }
 
-unsafe impl<K> Send for Cache<K> {}
-unsafe impl<K> Sync for Cache<K> {}
+unsafe impl<K: Send> Send for Cache<K> {}
+unsafe impl<K: Sync> Sync for Cache<K> {}
 
 impl<K: Hash + Eq> Cache<K> {
     /// Create a new cache setting page size and number of pages.
